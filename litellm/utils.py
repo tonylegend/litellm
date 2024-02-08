@@ -8,6 +8,9 @@
 #  Thank you users! We ❤️ you! - Krrish & Ishaan
 
 import sys, re, binascii, struct
+
+from openai.types.chat import ChatCompletion
+
 import litellm
 import dotenv, json, traceback, threading, base64, ast
 import subprocess, os
@@ -7847,6 +7850,8 @@ class CustomStreamWrapper:
                 else:
                     chunk = next(self.completion_stream)
                 if chunk is not None and chunk != b"":
+                    if isinstance(chunk, ChatCompletion):
+                        return chunk
                     print_verbose(f"PROCESSED CHUNK PRE CHUNK CREATOR: {chunk}")
                     response = self.chunk_creator(chunk=chunk)
                     print_verbose(f"PROCESSED CHUNK POST CHUNK CREATOR: {response}")
