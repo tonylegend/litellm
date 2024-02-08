@@ -1,6 +1,13 @@
-from typing import Optional, Union, Any
-import types, time, json
+from typing import Union
+import types
 import httpx
+
+from openai.types import CreateEmbeddingResponse, Embedding
+import google.generativeai as genai
+
+from aix.data.model_config import OpenAIModelConfig
+from aix.utils.pages import config_model
+from autogen.oai.utils.conversation import Conversation
 from .base import BaseLLM
 from litellm.utils import (
     ModelResponse,
@@ -11,10 +18,8 @@ from litellm.utils import (
     Usage,
 )
 from typing import Callable, Optional
-import aiohttp, requests
 import litellm
-from .prompt_templates.factory import prompt_factory, custom_prompt
-from openai import OpenAI, AsyncOpenAI
+from autogen.oai.oai_client import OpenAI, AsyncOpenAI
 
 
 class OpenAIError(Exception):
@@ -203,6 +208,11 @@ class OpenAITextCompletionConfig:
 class OpenAIChatCompletion(BaseLLM):
     def __init__(self) -> None:
         super().__init__()
+        self.conversations = set()
+        model_config: OpenAIModelConfig = config_model()
+        self._session_token = model_config.chat_token
+        genai.configure(api_key=model_config.embedding_api_key)
+        self._client = None
 
     def completion(
         self,
@@ -224,6 +234,7 @@ class OpenAIChatCompletion(BaseLLM):
     ):
         super().completion()
         exception_mapping_worked = False
+        optional_params = optional_params or {}
         try:
             if headers:
                 optional_params["extra_headers"] = headers
@@ -238,7 +249,8 @@ class OpenAIChatCompletion(BaseLLM):
             for _ in range(
                 2
             ):  # if call fails due to alternating messages, retry with reformatted message
-                data = {"model": model, "messages": messages, **optional_params}
+                data = {"model": model, "messages": messages, "session_token": self._session_token,
+                        "max_retries": 1, **optional_params}
 
                 try:
                     max_retries = data.pop("max_retries", 2)
@@ -285,13 +297,15 @@ class OpenAIChatCompletion(BaseLLM):
                                 status_code=422, message="max retries must be an int"
                             )
                         if client is None:
-                            openai_client = OpenAI(
-                                api_key=api_key,
-                                base_url=api_base,
-                                http_client=litellm.client_session,
-                                timeout=timeout,
-                                max_retries=max_retries,
-                            )
+                            if self._client is None:
+                                self._client = OpenAI(
+                                    api_key=api_key,
+                                    base_url=api_base,
+                                    http_client=litellm.client_session,
+                                    timeout=timeout,
+                                    max_retries=max_retries,
+                                )
+                            openai_client = self._client
                         else:
                             openai_client = client
 
@@ -301,13 +315,24 @@ class OpenAIChatCompletion(BaseLLM):
                             api_key=openai_client.api_key,
                             additional_args={
                                 "headers": headers,
-                                "api_base": openai_client._base_url._uri_reference,
+                                # "api_base": openai_client._base_url._uri_reference,
+                                "api_base": "",
                                 "acompletion": acompletion,
                                 "complete_input_dict": data,
                             },
                         )
 
-                        response = openai_client.chat.completions.create(**data, timeout=timeout)  # type: ignore
+                        sender = data.pop('sender', None)
+                        recipient = data.pop('recipient', None)
+                        conversation = next(
+                            (c for c in self.conversations if c.sender == sender and c.recipient == recipient),
+                            Conversation(sender=sender, recipient=recipient))
+                        self.conversations.add(conversation)
+                        data['bot_id'] = conversation.bot_id
+                        # stream = data.pop('stream', False)
+
+                        # response = None
+                        response = openai_client.chat.completions.create(**data, timeout=timeout)
                         stringified_response = response.model_dump()
                         logging_obj.post_call(
                             input=messages,
@@ -417,13 +442,15 @@ class OpenAIChatCompletion(BaseLLM):
         headers=None,
     ):
         if client is None:
-            openai_client = OpenAI(
-                api_key=api_key,
-                base_url=api_base,
-                http_client=litellm.client_session,
-                timeout=timeout,
-                max_retries=max_retries,
-            )
+            if self._client is None:
+                self._client = OpenAI(
+                    api_key=api_key,
+                    base_url=api_base,
+                    http_client=litellm.client_session,
+                    timeout=timeout,
+                    max_retries=max_retries,
+                )
+            openai_client = self._client
         else:
             openai_client = client
         ## LOGGING
@@ -437,6 +464,15 @@ class OpenAIChatCompletion(BaseLLM):
                 "complete_input_dict": data,
             },
         )
+
+        sender = data.pop('sender', None)
+        recipient = data.pop('recipient', None)
+        conversation = next(
+            (c for c in self.conversations if c.sender == sender and c.recipient == recipient),
+            Conversation(sender=sender, recipient=recipient))
+        self.conversations.add(conversation)
+        data['bot_id'] = conversation.bot_id
+
         response = openai_client.chat.completions.create(**data, timeout=timeout)
         streamwrapper = CustomStreamWrapper(
             completion_stream=response,
@@ -566,6 +602,7 @@ class OpenAIChatCompletion(BaseLLM):
     ):
         super().embedding()
         exception_mapping_worked = False
+        optional_params = optional_params or {}
         try:
             model = model
             data = {"model": model, "input": input, **optional_params}
@@ -582,19 +619,32 @@ class OpenAIChatCompletion(BaseLLM):
             if aembedding == True:
                 response = self.aembedding(data=data, input=input, logging_obj=logging_obj, model_response=model_response, api_base=api_base, api_key=api_key, timeout=timeout, client=client, max_retries=max_retries)  # type: ignore
                 return response
-            if client is None:
-                openai_client = OpenAI(
-                    api_key=api_key,
-                    base_url=api_base,
-                    http_client=litellm.client_session,
-                    timeout=timeout,
-                    max_retries=max_retries,
-                )
-            else:
-                openai_client = client
+            # if client is None:
+            #     if self._client is None:
+            #         self._client = OpenAI(
+            #             api_key=api_key,
+            #             base_url=api_base,
+            #             http_client=litellm.client_session,
+            #             timeout=timeout,
+            #             max_retries=max_retries,
+            #         )
+            #     openai_client = self._client
+            # else:
+            #     openai_client = client
 
             ## COMPLETION CALL
-            response = openai_client.embeddings.create(**data, timeout=timeout)  # type: ignore
+            if isinstance(input, str):
+                input = [input]
+            embedding_list = genai.embed_content(
+                model="models/embedding-001",
+                content=input,
+                task_type="semantic_similarity",
+            ).get("embedding", [])
+            embedding_data = []
+            for i, d in enumerate(embedding_list):
+                embedding_data.append(Embedding(embedding=d, index=i, object="embedding"))
+            response = CreateEmbeddingResponse(data=embedding_data, model=model, object="list", usage=Usage(prompt_tokens=0, total_tokens=0))
+            # response = openai_client.embeddings.create(**data, timeout=timeout)  # type: ignore
             ## LOGGING
             logging_obj.post_call(
                 input=input,
